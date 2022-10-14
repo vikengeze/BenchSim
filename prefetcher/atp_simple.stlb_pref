@@ -1,0 +1,515 @@
+#include "cache.h"
+#include <cmath>
+
+#define TABLE_SIZE 64
+#define ASSOC 4
+#define INVALID 0xdeadbeef
+#define ENABLE_BOTH 666
+#define FPQ_SIZE 16
+#define SAT_POW 256
+
+class PC_ASP{
+	public:
+		uint64_t pc;
+		uint64_t previous_vpn;
+		uint64_t stride;
+		int sign;
+		uint64_t timestamp;
+		PC_ASP(){
+			pc = 0;
+			previous_vpn = 0;
+			stride = INVALID;
+			sign = 1;
+			timestamp = 0;
+		}
+};
+
+class INFO_TRACKER{
+	public:
+		uint64_t previous_distance;
+		uint64_t previous_vpn;
+		int previous_sign;
+
+		INFO_TRACKER(){
+			previous_distance = 0;
+			previous_vpn = 0;
+			previous_sign = 1;
+		}   
+};
+
+class FakePQ{
+	public:
+		uint64_t queue[FPQ_SIZE];
+		int evict_ptr;               
+		FakePQ(){
+			for(int f=0; f<FPQ_SIZE; f++){ queue[f] = 0; }
+			evict_ptr = 0;
+		}
+};
+
+INFO_TRACKER tracker;
+PC_ASP pc_asp_tracker[(int)pow(2.0, ceil(log2(TABLE_SIZE/ASSOC)))][ASSOC];
+
+// Fake Prefetch Queues (one per constituent TLB Prefetcher)
+FakePQ pc_asp_fq;
+FakePQ stride_fq;                                                                                           
+FakePQ h2p_fq;                                                                                           
+
+// Activations per TLB Prefetcher
+uint64_t activation_cnt_stride = 0, activation_cnt_pcasp = 0, activation_cnt_h2p = 0, activation_cnt_disable = 0;
+
+// LRU timer
+uint64_t time_c;                                                                                              
+
+int saturation_counter_c2 = 0, saturation_counter_c1 = 0, disable_sat_cnt = SAT_POW; 
+
+void activation(int pref){
+	if(pref == 1)
+		activation_cnt_stride++;
+	else if(pref == 0)
+		activation_cnt_pcasp++;
+	else if (pref == 2)
+		activation_cnt_h2p++;
+	else
+		activation_cnt_disable++;
+}
+
+int check_duplicates(uint64_t pref, int leaf){
+	if(leaf==1){
+		for(int f=0; f < FPQ_SIZE; f++){
+			if(stride_fq.queue[f] == pref)
+				return 0;
+		}
+	}
+	else if(leaf==0){
+		for(int f=0; f < FPQ_SIZE; f++){
+			if(pc_asp_fq.queue[f] == pref)
+				return 0;
+		}
+	}
+	else if(leaf==2){
+		for(int f=0; f < FPQ_SIZE; f++){
+			if(h2p_fq.queue[f] == pref)
+				return 0;
+		}
+	}
+	else
+		return 0;
+
+	return 1;
+}
+
+void CACHE::stlb_prefetcher_initialize(){
+	cout << "CPU " << cpu << " STLB -- ATP (simple)" << endl;
+}
+
+void CACHE::stlb_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, int answer, int warmup, int * free_indexes, uint64_t instr_id, int iflag){
+
+	uint64_t index, bits, current_vpn, pf_addr; 
+	int i, empty=-1, hit_pc_asp_fq=0, hit_stride_fq=0, hit_h2p_fq=0, enable_prefetcher=0, 
+		cache_line_position, cache_line_position_n, acc, check, free_bit=0, flag=0, previous_free_bit;
+
+	time_c++;
+	current_vpn = addr;
+	cache_line_position = (current_vpn & 0x07);
+
+	// FAKE PQ LOOKUP
+	for(int f=0; f<FPQ_SIZE; f++){
+		if(pc_asp_fq.queue[f] == current_vpn){
+			hit_pc_asp_fq++;
+			break;
+		}
+	}
+
+	for(int f=0; f<FPQ_SIZE; f++){
+		if(stride_fq.queue[f] == current_vpn){
+			hit_stride_fq++;
+			break;
+		}
+	}
+
+	for(int f=0; f<FPQ_SIZE; f++){
+		if(h2p_fq.queue[f] == current_vpn){
+			hit_h2p_fq++;
+			break;
+		}
+	}
+	// END OF FAKE PQ LOOKUP 
+
+	
+	int c2_hit = 1;
+	if(hit_stride_fq == hit_pc_asp_fq){
+		if(hit_stride_fq == 0)
+			c2_hit = 0;
+	}
+
+	if(c2_hit == hit_h2p_fq){
+		if(hit_h2p_fq == 0 && warmup){
+			if(disable_sat_cnt != 0)
+				disable_sat_cnt--;
+		}
+		else{
+			if(disable_sat_cnt != SAT_POW && warmup)
+				disable_sat_cnt++;
+		}	
+	}
+	else if(hit_h2p_fq > c2_hit){
+		if(disable_sat_cnt != SAT_POW && warmup) 
+			disable_sat_cnt++;
+
+		if(saturation_counter_c1 != 63)
+			saturation_counter_c1++;
+	}
+	else if(hit_h2p_fq < c2_hit){
+		if(disable_sat_cnt != SAT_POW && warmup)
+			disable_sat_cnt++;
+
+		if(saturation_counter_c1 != 0)
+			saturation_counter_c1--;
+	}
+	else
+		assert(0);
+
+
+	// TLB PREFETCHER SELECTION 
+	if(saturation_counter_c1 < 31){
+		if(saturation_counter_c2 < 2)
+			enable_prefetcher = 0;
+		else
+			enable_prefetcher = 1;
+	}
+	else
+		enable_prefetcher = 2;
+
+	if(disable_sat_cnt == 0 && warmup){
+		disable_sat_cnt++;
+	}
+	// END OF TLB PREFETCHER SELECTION
+
+	if((enable_prefetcher == ENABLE_BOTH) && (answer !=-1))
+		enable_prefetcher = 667;
+
+	if(warmup)
+		activation(enable_prefetcher);
+
+	// FAKE STRIDE PREFETCHING
+	for(int r=-2; r<3; r++){
+		if(r == 0) continue;
+
+		uint64_t f_pf_addr;
+
+		f_pf_addr = current_vpn + r;
+
+		if(check_duplicates(f_pf_addr, 1)){
+			stride_fq.queue[stride_fq.evict_ptr] = f_pf_addr;
+			stride_fq.evict_ptr = (stride_fq.evict_ptr + 1)%FPQ_SIZE;
+		}
+	}
+
+	bits = ceil(log2(TABLE_SIZE/ASSOC)); // bits for indexing the PC_TABLE of MASP
+
+	index = ip & ((1 << bits) - 1);
+
+	for(i=0; i<ASSOC; i++){
+
+		if(ip == pc_asp_tracker[index][i].pc){
+
+			pc_asp_tracker[index][i].timestamp = time_c;
+
+			if(pc_asp_tracker[index][i].stride != INVALID){
+
+				pf_addr = current_vpn + pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride;
+				if(check_duplicates(pf_addr, 0)){          
+					pc_asp_fq.queue[pc_asp_fq.evict_ptr] = pf_addr;
+					pc_asp_fq.evict_ptr = (pc_asp_fq.evict_ptr + 1)%FPQ_SIZE;
+				}
+
+				cache_line_position_n = (pf_addr & 0x07);
+
+				if(enable_prefetcher == ENABLE_BOTH){
+					check = pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride + cache_line_position;
+					if(check >=0 && check <=7 && answer == -1){
+						if(ENABLE_FP)
+							prefetch_page(ip, addr, pf_addr, FILL_L2, 0, 1, 1, check, instr_id, type, iflag, 0, 0, 0);
+						else
+							prefetch_page(ip, addr, pf_addr, FILL_L2, 0, 0, 0, 0, instr_id, type, iflag, 0, 0, 0);
+					}
+				}
+
+				if(enable_prefetcher == 0){
+					flag = 1;
+
+					if(answer == -1 && ENABLE_FP){
+						cache_line_position = (current_vpn & 0x07);
+						if(((cache_line_position+pc_asp_tracker[index][i].sign*pc_asp_tracker[index][i].stride)<8)&&((cache_line_position+pc_asp_tracker[index][i].sign*pc_asp_tracker[index][i].stride)>=0))
+							free_bit = 1;
+					}
+
+					prefetch_page(ip, addr, pf_addr, FILL_L2, 0, free_bit, free_bit, 0, instr_id, type, iflag, 0, 0, 0);
+
+					cache_line_position_n = (pf_addr & 0x07);
+				}
+			}
+
+			if(current_vpn < pc_asp_tracker[index][i].previous_vpn){
+				pc_asp_tracker[index][i].stride = pc_asp_tracker[index][i].previous_vpn - current_vpn;
+				pc_asp_tracker[index][i].sign = -1;
+			}
+			else{
+				pc_asp_tracker[index][i].stride = current_vpn - pc_asp_tracker[index][i].previous_vpn;
+				pc_asp_tracker[index][i].sign = 1;
+			}
+
+			previous_free_bit = flag * free_bit;
+			free_bit = 0;
+
+			if(answer == -1 && ENABLE_FP){
+
+				cache_line_position = (current_vpn & 0x07);
+
+				if(((cache_line_position + pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride) < 8) && ((cache_line_position + pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride) >= 0))
+					free_bit = 1;
+
+				if((free_bit == 0) && (previous_free_bit == 1) && (flag == 1)){
+					cache_line_position = (pf_addr & 0x07);
+					if(((cache_line_position + pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride) < 8) && ((cache_line_position + pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride) >= 0))
+						free_bit = 1;
+				}
+			}
+			else{
+				if(flag && ENABLE_FP){
+					cache_line_position = (pf_addr & 0x07);
+					if(((cache_line_position + pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride) < 8) && ((cache_line_position + pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride) >= 0))
+						free_bit = 1;
+				}
+			}
+
+			pf_addr = current_vpn + pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride;
+			if(check_duplicates(pf_addr, 0)){
+				pc_asp_fq.queue[pc_asp_fq.evict_ptr] = pf_addr;
+				pc_asp_fq.evict_ptr = (pc_asp_fq.evict_ptr + 1)%FPQ_SIZE;
+			}
+
+			cache_line_position_n = (pf_addr & 0x07);
+
+			if(enable_prefetcher == ENABLE_BOTH){
+				check = pc_asp_tracker[index][i].sign * pc_asp_tracker[index][i].stride + cache_line_position;
+				if(check >=0 && check <=7 && answer == -1){
+					if(ENABLE_FP)
+						prefetch_page(ip, addr, pf_addr, FILL_L2, 0, 1, 1, check, instr_id, type, iflag, 0, 0, 0);
+					else
+						prefetch_page(ip, addr, pf_addr, FILL_L2, 0, 0, 0, 0, instr_id, type, iflag, 0, 0, 0);
+				}
+			}
+
+			if(enable_prefetcher == 0){
+				prefetch_page(ip, addr, pf_addr, FILL_L2, 0, free_bit, free_bit, 0, instr_id, type, iflag, 0, 0, 0);
+				cache_line_position_n = (pf_addr & 0x07);
+			}
+
+			pc_asp_tracker[index][i].previous_vpn = current_vpn;
+			break;
+		}
+
+		if(pc_asp_tracker[index][i].pc == 0)
+			empty = i;
+	}
+
+	if(i == ASSOC){
+		if(empty == -1){
+			uint64_t lru_min = pc_asp_tracker[index][0].timestamp;
+			int lru_victim = 0;
+			for(int m=1; m<ASSOC; m++){
+				if(pc_asp_tracker[index][m].timestamp < lru_min){
+					lru_min = pc_asp_tracker[index][m].timestamp;
+					lru_victim = m;
+				}
+			}
+			pc_asp_tracker[index][lru_victim].pc = ip;
+			pc_asp_tracker[index][lru_victim].previous_vpn = current_vpn;
+			pc_asp_tracker[index][lru_victim].stride = INVALID;
+			pc_asp_tracker[index][lru_victim].sign = 1;
+			pc_asp_tracker[index][lru_victim].timestamp = time_c;
+		}
+		else{
+			// empty block
+			pc_asp_tracker[index][empty].pc = ip;
+			pc_asp_tracker[index][empty].previous_vpn = current_vpn;
+			pc_asp_tracker[index][empty].stride = INVALID;
+			pc_asp_tracker[index][empty].sign = 1;
+			pc_asp_tracker[index][empty].timestamp = time_c;
+		}
+	}
+
+	free_bit = 0;
+	if(enable_prefetcher == 1){
+		int track_plus1 = 0, track_minus1 = 0;
+
+		cache_line_position = (current_vpn & 0x07);
+
+		for(int j=-2; j<3; j++){
+			if(j != 0) continue;
+
+			pf_addr = current_vpn + j;
+
+			if(ENABLE_FP){
+				if(answer == -1){
+					if(((cache_line_position+j)<8) && ((cache_line_position+j)>=0))
+						free_bit = 1;
+					if(j == -1)
+						free_bit = 1;
+					if(j == 1)
+						track_plus1 = free_bit;
+					if((j==2) && (track_plus1 == 0) && (free_bit == 0))
+						free_bit = 1;
+				}
+				else{
+					if(j == -2)
+						cache_line_position = ((current_vpn + j) & 0x0F);
+					else{
+						int stride;
+						if(j == -1) stride = 1;
+						else stride = j + 2;
+						if(((cache_line_position+stride)<8) && ((cache_line_position+stride)>=0))
+							free_bit = 1;
+					}
+					if(track_minus1 == 1)
+						free_bit = 1;
+					if(track_plus1 == 1)
+						free_bit = 1;
+					if((i == 1) && (free_bit == 0))
+						track_plus1 = 1;
+					if((i == -1) && free_bit == 0)
+						track_minus1 = 1;
+				}
+			}
+
+			prefetch_page(ip, addr, pf_addr, FILL_L2, 0, free_bit, free_bit, 0, instr_id, type, iflag, 0, 0, 0);
+			cache_line_position_n = (pf_addr & 0x07);
+			free_bit = 0;
+		}
+	}
+
+	uint64_t current_distance;
+	int sign = 1;
+
+	previous_free_bit = 0;
+
+	if (current_vpn < tracker.previous_vpn){
+		current_distance = tracker.previous_vpn - current_vpn;
+		sign = -1;
+	}
+	else
+		current_distance = current_vpn - tracker.previous_vpn;
+
+	pf_addr = current_vpn + sign*current_distance;
+	// fake prefetching for H2P
+	if(check_duplicates(pf_addr, 2)){
+		h2p_fq.queue[h2p_fq.evict_ptr] = pf_addr;
+		h2p_fq.evict_ptr = (h2p_fq.evict_ptr + 1)%FPQ_SIZE;
+	}
+
+	uint64_t next_prefetch;
+
+	next_prefetch = (current_vpn + tracker.previous_sign*tracker.previous_distance);
+
+	// fake prefetching for H2P
+	if(check_duplicates(next_prefetch, 2)){
+		h2p_fq.queue[h2p_fq.evict_ptr] = next_prefetch;
+		h2p_fq.evict_ptr = (h2p_fq.evict_ptr + 1)%FPQ_SIZE;
+	}
+
+	if(enable_prefetcher == ENABLE_BOTH){
+		check = sign*current_distance + cache_line_position;
+		if(check >=0 && check <=7 && answer == -1){
+			if(ENABLE_FP)
+				prefetch_page(ip, addr, pf_addr, FILL_L2, 0, 1, 1, check, instr_id, type, iflag, 0, 0, 0);
+			else
+				prefetch_page(ip, addr, pf_addr, FILL_L2, 0, 0, 0, 0, instr_id, type, iflag, 0, 0, 0);
+		}
+
+		check = tracker.previous_sign*tracker.previous_distance + cache_line_position;
+		if(check >=0 && check <=7 && answer == -1){
+			if(ENABLE_FP)
+				prefetch_page(ip, addr, next_prefetch, FILL_L2, 0, 1, 1, check, instr_id, type, iflag, 0, 0, 0);
+			else
+				prefetch_page(ip, addr, next_prefetch, FILL_L2, 0, 0, 0, 0, instr_id, type, iflag, 0, 0, 0);
+		}
+	}
+
+	free_bit = 0;
+
+	if(answer == -1 && ENABLE_FP){
+		cache_line_position = (current_vpn & 0x07);
+		if(((cache_line_position + sign*current_distance) < 8) && ((cache_line_position + sign*current_distance) >= 0))
+			free_bit = 1;
+	}
+
+	if(enable_prefetcher == 2){
+		prefetch_page(ip, addr, pf_addr, FILL_L2, 0, free_bit, free_bit, 0, instr_id, type, iflag, 0, 0, 0);
+
+		cache_line_position_n = (pf_addr & 0x07);
+
+		previous_free_bit = free_bit;
+		free_bit = 0;
+
+		if(ENABLE_FP){
+			if(answer == -1){
+				if(((cache_line_position + tracker.previous_sign*tracker.previous_distance) < 8) && ((cache_line_position + tracker.previous_sign*tracker.previous_distance) >= 0))
+					free_bit = 1;
+
+				if((free_bit == 0) && (previous_free_bit == 1)){
+					cache_line_position = (pf_addr & 0x07);
+					if(((cache_line_position + tracker.previous_sign*tracker.previous_distance) < 8) && ((cache_line_position + tracker.previous_sign*tracker.previous_distance) >= 0))
+						free_bit = 1;
+				}
+			}
+			else{
+				cache_line_position_n = (pf_addr & 0x07);
+				if(((cache_line_position_n + tracker.previous_sign*tracker.previous_distance) < 8) && ((cache_line_position_n + tracker.previous_sign*tracker.previous_distance) >= 0))
+					free_bit = 1;
+			}
+		}
+
+		pf_addr = (current_vpn + tracker.previous_sign*tracker.previous_distance);
+		prefetch_page(ip, addr, pf_addr, FILL_L2, 0, free_bit, free_bit, 0, instr_id, type, iflag, 0, 0, 0);
+
+		cache_line_position_n = (pf_addr & 0x07);
+	}
+
+	tracker.previous_vpn = current_vpn;
+	tracker.previous_sign = sign;
+	tracker.previous_distance = current_distance;
+}
+
+void CACHE::stlb_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr){
+
+}
+
+
+void CACHE::stlb_prefetcher_final_stats(uint64_t prefetches, uint64_t hits, uint64_t misses, uint64_t swap, uint64_t dupli, uint64_t free, uint64_t real, uint64_t * mmu_cache_demand_hits, uint64_t * mmu_cache_prefetch_hits, uint64_t * rfhits, uint64_t * free_hits, uint64_t mr[4][4], uint64_t stlb_misses[2]){
+    cout << endl << "*******************************************" << endl;
+    cout << "*******************************************\n" << endl;
+
+    cout << "CPU " << cpu << " STLB -- ATP final stats" << endl;
+
+    cout << endl << "-------------------------------------------" << endl;
+    cout << "D-STLB MISSES: " << stlb_misses[0] << endl;
+    cout << "I-STLB MISSES: " << stlb_misses[1] << endl;
+    cout << "-------------------------------------------" << endl;
+
+    cout << endl << "-------------------------------------------" << endl;
+    cout << "PQ hits: " << hits << endl;
+    cout << "PQ misses: " << misses << endl;
+    cout << "-------------------------------------------" << endl;
+
+    cout << endl << "-------------------------------------------" << endl;
+    cout << "Activation MASP: " << activation_cnt_pcasp << endl;
+    cout << "Activation STP: " << activation_cnt_stride << endl;
+    cout << "Activation H2P: " << activation_cnt_h2p << endl;
+    cout << "Disable Prefetching: " << activation_cnt_disable << endl;
+    cout << "-------------------------------------------" << endl;
+
+    cout << "\n*******************************************" << endl;
+    cout << "*******************************************" << endl;
+}
